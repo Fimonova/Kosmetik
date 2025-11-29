@@ -1,25 +1,19 @@
 # main.py
-import os, time, hmac, hashlib, json, re
+import os, time, hmac, hashlib, json
 from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, constr
+from pydantic import BaseModel
 import databases
 import sqlalchemy
 from dotenv import load_dotenv  
-load_dotenv()
-
-# ==========================
-# CONFIG
-# ==========================
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://...")
-
-API_KEY      = os.getenv("API_KEY", "your_api_key_here")
-HMAC_SECRET  = os.getenv("HMAC_SECRET", "your_hmac_secret_here")
+load_dotenv()  # تحميل متغيرات البيئة من ملف .env
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://fimodb_user:o4gHKsxV262NQAVzH7A7DsUebFS6a7F3@dpg-d4ku7didbo4c73e78720-a.oregon-postgres.render.com/fimodb")
+API_KEY = os.getenv("API_KEY", "your_api_key_hereasdasdasd")
+HMAC_SECRET = os.getenv("HMAC_SECRET", "your_hmac_secret_hereasdasdasdasd")
 
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
 
-# جدول الطلاب بالشهادات
+# جدول الطلاب بالشهادات مباشرة
 students = sqlalchemy.Table(
     "students", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
@@ -34,28 +28,14 @@ students = sqlalchemy.Table(
 
 app = FastAPI(title="Fimonova Remote API")
 
-# ==========================
-# CORS — فقط للفرونت إند
-# ==========================
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://aa6612929.github.io",
-        "https://aa6612929.github.io/checkZertifikate",
-        "https://www.fimonova-kosmetik.de",
-        "https://fimonova-kosmetik.de",
-    ],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# ==========================
-# MODELS
-# ==========================
+# ---- Pydantic models ----
+
 class SearchPayload(BaseModel):
     firstname: str
     lastname: str
     birthdate: str
+
 
 class StudentPayload(BaseModel):
     firstname: str
@@ -66,13 +46,7 @@ class StudentPayload(BaseModel):
     cert_serial_sn: str
     cert_random_code: str
 
-class VerifyPublicPayload(BaseModel): 
-    serial_number: constr(strip_whitespace=True, min_length=3, max_length=50)
-    random_code:   constr(strip_whitespace=True, min_length=3, max_length=50)
-
-# ==========================
-# HMAC / Signing (للنظام الأساسي)
-# ==========================
+# ---- Utilities ----
 def canonical_json(obj):
     return json.dumps(obj, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
 
@@ -95,10 +69,17 @@ def verify_request_signature(body_obj, x_signature: str, x_timestamp: str, autho
     if not hmac.compare_digest(expected, x_signature):
         raise HTTPException(401, "Invalid signature")
 
-# ==========================
-# DB HELPERS
-# ==========================
+# ---- DB helpers ----
 async def upsert_student(payload: dict):
+    """
+    /update:
+      - نبحث عن صف يطابق ٥ عناصر:
+          firstname, lastname, birthdate, cert_name, cert_serial_sn
+      - إذا وجدناه => نحدّث (gender, cert_random_code) لنفس الصف فقط.
+      - إذا لم نجده => نضيف صف جديد (شهادة جديدة).
+      - الـ cert_random_code لا يدخل في شرط التطابق.
+    """
+
     row = await database.fetch_one(
         """
         SELECT id FROM students
@@ -108,63 +89,73 @@ async def upsert_student(payload: dict):
            AND cert_name      = :cert_name
            AND cert_serial_sn = :cert_serial_sn
         """,
-        values=payload,
+        values={
+            "firstname":      payload["firstname"],
+            "lastname":       payload["lastname"],
+            "birthdate":      payload["birthdate"],
+            "cert_name":      payload["cert_name"],
+            "cert_serial_sn": payload["cert_serial_sn"],
+        }
     )
+
     if row:
+        # ✅ نفس الشهادة (٥ عناصر متطابقة) → نحدّث فقط
+        update_values = {
+            "id": row["id"],
+            "gender":          payload["gender"],
+            "cert_random_code": payload["cert_random_code"],
+        }
+
         await database.execute(
             """
             UPDATE students
-               SET gender = :gender,
+               SET gender          = :gender,
                    cert_random_code = :cert_random_code
              WHERE id = :id
             """,
-            values={
-                "id": row["id"],
-                "gender": payload["gender"],
-                "cert_random_code": payload["cert_random_code"],
-            },
+            values=update_values
         )
-        return {"status": "updated", "student_id": row["id"]}
+        return {
+            "status": "updated",
+            "student_id": row["id"],
+        }
+
+    # ❌ لم نجد صف يطابق الخمسة عناصر → شهادة جديدة تماماً → نضيف صف جديد
+    insert_values = {
+        "firstname":       payload["firstname"],
+        "lastname":        payload["lastname"],
+        "birthdate":       payload["birthdate"],
+        "gender":          payload["gender"],
+        "cert_name":       payload["cert_name"],
+        "cert_serial_sn":  payload["cert_serial_sn"],
+        "cert_random_code": payload["cert_random_code"],
+    }
 
     student_id = await database.execute(
         """
         INSERT INTO students
-            (firstname, lastname, birthdate, gender, cert_name, cert_serial_sn, cert_random_code)
+            (firstname, lastname, birthdate, gender,
+             cert_name, cert_serial_sn, cert_random_code)
         VALUES
-            (:firstname, :lastname, :birthdate, :gender, :cert_name, :cert_serial_sn, :cert_random_code)
+            (:firstname, :lastname, :birthdate, :gender,
+             :cert_name, :cert_serial_sn, :cert_random_code)
         RETURNING id
         """,
-        values=payload,
+        values=insert_values
     )
 
-    return {"status": "inserted", "student_id": student_id}
+    return {
+        "status": "inserted",
+        "student_id": student_id,
+    }
 
-# ==========================
-# RATE LIMIT FOR PUBLIC ENDPOINT
-# ==========================
-REQUESTS_WINDOW_SECONDS = 60
-REQUESTS_MAX_PER_IP     = 40
 
-rate_limiter = {}  
-def rate_limit(ip: str):
-    now = time.time()
-    bucket = rate_limiter.get(ip)
-    if not bucket:
-        rate_limiter[ip] = {"start": now, "count": 1}
-        return
-    if now - bucket["start"] > REQUESTS_WINDOW_SECONDS:
-        rate_limiter[ip] = {"start": now, "count": 1}
-        return
-    if bucket["count"] >= REQUESTS_MAX_PER_IP:
-        raise HTTPException(429, "Zu viele Anfragen. Bitte später versuchen.")
-    bucket["count"] += 1
 
-# ==========================
-# STARTUP / SHUTDOWN
-# ==========================
+# ---- Endpoints ----
 @app.on_event("startup")
 async def startup():
     await database.connect()
+    # إنشاء الجدول إذا لم يكن موجود
     engine = sqlalchemy.create_engine(DATABASE_URL)
     metadata.create_all(engine)
 
@@ -172,14 +163,9 @@ async def startup():
 async def shutdown():
     await database.disconnect()
 
-# ==========================
-# EXISTING ENDPOINTS (لا تعديل)
-# ==========================
 @app.post("/add")
 async def add_student(payload: StudentPayload, request: Request,
-                      x_signature: str = Header(None),
-                      x_timestamp: str = Header(None),
-                      authorization: str = Header(None)):
+                      x_signature: str = Header(None), x_timestamp: str = Header(None), authorization: str = Header(None)):
     body = payload.dict()
     verify_request_signature(body, x_signature, x_timestamp, authorization)
     res = await upsert_student(body)
@@ -187,19 +173,16 @@ async def add_student(payload: StudentPayload, request: Request,
 
 @app.post("/update")
 async def update_student(payload: StudentPayload, request: Request,
-                      x_signature: str = Header(None),
-                      x_timestamp: str = Header(None),
-                      authorization: str = Header(None)):
+                      x_signature: str = Header(None), x_timestamp: str = Header(None), authorization: str = Header(None)):
     body = payload.dict()
     verify_request_signature(body, x_signature, x_timestamp, authorization)
     res = await upsert_student(body)
     return {"result": "updated", **res}
 
+
 @app.post("/delete")
 async def delete_student(payload: StudentPayload, request: Request,
-                      x_signature: str = Header(None),
-                      x_timestamp: str = Header(None),
-                      authorization: str = Header(None)):
+                      x_signature: str = Header(None), x_timestamp: str = Header(None), authorization: str = Header(None)):
     body = payload.dict()
     verify_request_signature(body, x_signature, x_timestamp, authorization)
     await database.execute(
@@ -209,7 +192,11 @@ async def delete_student(payload: StudentPayload, request: Request,
            AND lastname  = :lastname
            AND birthdate = :birthdate
         """,
-        values=body,
+        values={
+            "firstname": body["firstname"],
+            "lastname": body["lastname"],
+            "birthdate": body["birthdate"],
+        }
     )
     return {"result": "deleted"}
 
@@ -228,17 +215,17 @@ async def search_student(payload: SearchPayload, request: Request,
            AND lastname  = :lastname
            AND birthdate = :birthdate
         """,
-        values=body,
+        values=body
     )
     if not row:
         return {"found": False}
     return {"found": True, "student": dict(row)}
 
+
+# ---- secured verification page ----
 @app.get("/verify")
 async def verify_page(firstname: str, lastname: str, birthdate: str,
-                      x_abi_key: str = Header(None),
-                      x_signature: str = Header(None),
-                      x_timestamp: str = Header(None)):
+                      x_abi_key: str = Header(None), x_signature: str = Header(None), x_timestamp: str = Header(None)):
     if x_abi_key != API_KEY:
         raise HTTPException(401, "Unauthorized")
     body = {"firstname": firstname, "lastname": lastname, "birthdate": birthdate}
@@ -250,58 +237,23 @@ async def verify_page(firstname: str, lastname: str, birthdate: str,
            AND lastname  = :lastname
            AND birthdate = :birthdate
         """,
-        values=body,
+        values={
+            "firstname": firstname,
+            "lastname": lastname,
+            "birthdate": birthdate,
+        }
     )
     if not row:
         return {"found": False}
     return {"found": True, "student": dict(row)}
 
-# ==========================
-# PUBLIC ENDPOINT FOR WEBSITE
-# ==========================
-@app.post("/verify_public")
-async def verify_public(request: Request, payload: VerifyPublicPayload):
-    client_ip = request.client.host
-    rate_limit(client_ip)
-
-    serial  = payload.serial_number
-    random  = payload.random_code
-
-    # Regex حماية
-    allowed = re.compile(r"^[A-Za-z0-9\-]+$")
-    if not allowed.fullmatch(serial) or not allowed.fullmatch(random):
-        raise HTTPException(400, "Ungültige Eingabe.")
-
-    row = await database.fetch_one(
-        """
-        SELECT firstname, lastname, cert_name, birthdate
-        FROM students
-        WHERE cert_serial_sn = :sn
-          AND cert_random_code = :rc
-        """,
-        values={"sn": serial, "rc": random},
-    )
-
-    if not row:
-        return {"found": False}
-
-    return {
-        "found": True,
-        "student": {
-            "firstname": row["firstname"],
-            "lastname": row["lastname"],
-            "cert_name": row["cert_name"],
-            "birthdate": row["birthdate"],
-        },
-    }
-
-# ==========================
-# WAKE ENDPOINT
-# ==========================
-@app.get("/wake")
-async def wake():
-    return {"status": "awake"}
 
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "fimonova_api"}
+
+
+@app.get("/wake")
+async def wake():
+    # ما في منطق، المهم يرجع بسرعة ويصحّي السيرفر
+    return {"status": "awake"}
