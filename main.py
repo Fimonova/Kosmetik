@@ -10,6 +10,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://fimodb_user:o4gHKsxV262NQ
 API_KEY = os.getenv("API_KEY", "your_api_key_hereasdasdasd")
 HMAC_SECRET = os.getenv("HMAC_SECRET", "your_hmac_secret_hereasdasdasdasd")
 
+ALLOWED_PUBLIC_ORIGINS = [
+    "https://fimonova-kosmetik.de",
+    "https://www.fimonova-kosmetik.de"
+]
+
+
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
 
@@ -256,4 +262,66 @@ async def root():
 @app.get("/wake")
 async def wake():
     # ما في منطق، المهم يرجع بسرعة ويصحّي السيرفر
+    return {"status": "awake"}
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import re
+
+# --- تأكد من إضافة الـ CORS ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_PUBLIC_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.post("/verify_public")
+async def verify_public(request: Request, payload: dict):
+
+    # 1. التحقق من الـ Origin
+    origin = request.headers.get("origin")
+    if origin not in ALLOWED_PUBLIC_ORIGINS:
+        raise HTTPException(403, "Forbidden origin")
+
+    # 2. تنظيف المدخلات
+    serial = payload.get("serial_number", "").strip()
+    random_code = payload.get("random_code", "").strip()
+
+    # 3. فحص Regex لمنع الحقن
+    allowed = re.compile(r"^[A-Za-z0-9\-\_]+$")
+    if not allowed.fullmatch(serial) or not allowed.fullmatch(random_code):
+        raise HTTPException(400, "Ungültige Eingabe")
+
+    # 4. الاستعلام من قاعدة البيانات
+    row = await database.fetch_one(
+        """
+        SELECT firstname, lastname, cert_name, birthdate
+        FROM students
+        WHERE cert_serial_sn = :sn
+          AND cert_random_code = :rc
+        """,
+        values={"sn": serial, "rc": random_code}
+    )
+
+    if not row:
+        return {"found": False}
+
+    return {
+        "found": True,
+        "student": {
+            "firstname": row["firstname"],
+            "lastname": row["lastname"],
+            "cert_name": row["cert_name"],
+            "birthdate": row["birthdate"]
+        }
+    }
+
+
+@app.get("/wake_public")
+async def wake_public(request: Request):
+    origin = request.headers.get("origin")
+    if origin not in ALLOWED_PUBLIC_ORIGINS:
+        raise HTTPException(403, "Forbidden origin")
     return {"status": "awake"}
