@@ -10,6 +10,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://fimodb_user:o4gHKsxV262NQ
 API_KEY = os.getenv("API_KEY", "your_api_key_hereasdasdasd")
 HMAC_SECRET = os.getenv("HMAC_SECRET", "your_hmac_secret_hereasdasdasdasd")
 
+# الحد الأقصى لحجم قاعدة البيانات بالبايت (تقديري)
+# لو عندك في الخطة 1GB مثلاً، خليه 1000000000
+DB_MAX_BYTES = int(os.getenv("DB_MAX_BYTES", "1000000000"))
+
+
 ALLOWED_PUBLIC_ORIGINS = [
     "https://fimonova-kosmetik.de",
     "https://www.fimonova-kosmetik.de"
@@ -18,7 +23,7 @@ ALLOWED_PUBLIC_ORIGINS = [
 
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
-
+engine = sqlalchemy.create_engine(DATABASE_URL)
 # جدول الطلاب بالشهادات مباشرة
 students = sqlalchemy.Table(
     "students", metadata,
@@ -258,6 +263,40 @@ async def verify_page(firstname: str, lastname: str, birthdate: str,
 async def root():
     return {"status": "ok", "service": "fimonova_api"}
 
+
+
+
+@app.get("/db_size")
+async def get_db_size():
+    """
+    يرجّع حجم قاعدة البيانات الحالية بصيغة جميلة + النسبة من الحد الأقصى التقريبي.
+    """
+    # نستخدم دالة PostgreSQL pg_database_size على قاعدة البيانات الحالية
+    row = await database.fetch_one(
+        """
+        SELECT 
+            pg_database_size(current_database()) AS size_bytes,
+            pg_size_pretty(pg_database_size(current_database())) AS size_pretty
+        """
+    )
+
+    if not row:
+        # حالة نادرة: لو الاستعلام ما رجع شيء
+        raise HTTPException(500, "Cannot get database size")
+
+    size_bytes = int(row["size_bytes"])
+    size_pretty = row["size_pretty"]
+
+    used_percent = None
+    if DB_MAX_BYTES > 0:
+        used_percent = round((size_bytes / DB_MAX_BYTES) * 100, 2)
+
+    return {
+        "size_bytes": size_bytes,
+        "size_pretty": size_pretty,   # مثال: '123 MB'
+        "used_percent": used_percent, # مثال: 12.34 أو None لو DB_MAX_BYTES=0
+        "max_bytes": DB_MAX_BYTES
+    }
 
 @app.get("/wake")
 async def wake():
