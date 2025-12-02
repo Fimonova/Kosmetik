@@ -19,7 +19,7 @@ load_dotenv()
 # ===== إعدادات الاتصال وقيم عامة =====
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql:postgresql://neondb_owner:HWpoOYunK1l7@ep-twilight-river-xxxxx.neon.tech/neondb?sslmode=require"
+    "postgresql://neondb_owner:HWpoOYunK1l7@ep-twilight-river-xxxxx.neon.tech/neondb?sslmode=require"
 )
 API_KEY = os.getenv("API_KEY", "your_api_key_hereasdasdasd")
 HMAC_SECRET = os.getenv("HMAC_SECRET", "your_hmac_secret_hereasdasdasdasd")
