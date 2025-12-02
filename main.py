@@ -19,7 +19,7 @@ load_dotenv()
 # ===== إعدادات الاتصال وقيم عامة =====
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://fimodb_user:o4gHKsxV262NQAVzH7A7DsUebFS6a7F3@dpg-d4ku7didbo4c73e78720-a.oregon-postgres.render.com/fimodb"
+    "postgresql:postgresql://neondb_owner:HWpoOYunK1l7@ep-twilight-river-xxxxx.neon.tech/neondb?sslmode=require"
 )
 API_KEY = os.getenv("API_KEY", "your_api_key_hereasdasdasd")
 HMAC_SECRET = os.getenv("HMAC_SECRET", "your_hmac_secret_hereasdasdasdasd")
@@ -424,22 +424,32 @@ async def wake():
 # ---- واجهة التحقق العامة (لصفحة HTML) ----
 
 @app.post("/verify_public")
-async def verify_public(request: Request, payload: dict):
-    # 1. التحقق من الـ Origin
+async def verify_public(
+    request: Request,
+    payload: dict,
+    x_signature: str = Header(None),
+    x_timestamp: str = Header(None),
+    authorization: str = Header(None),
+):
+    # 1) التحقق من الـ Origin (زيادة أمان فوق التوقيع)
     origin = request.headers.get("origin")
     if origin not in ALLOWED_PUBLIC_ORIGINS:
         raise HTTPException(403, "Forbidden origin")
 
-    # 2. تنظيف المدخلات
+    # 2) التحقق من الـ API_KEY + HMAC (مثل /add و /search ...)
+    # body_obj هنا هو نفس الـ payload القادم من البروكسي (serial_number, random_code)
+    verify_request_signature(payload, x_signature, x_timestamp, authorization)
+
+    # 3) تنظيف المدخلات
     serial = payload.get("serial_number", "").strip()
     random_code = payload.get("random_code", "").strip()
 
-    # 3. فحص Regex لمنع الحقن
+    # 4) فحص Regex لمنع الحقن
     allowed = re.compile(r"^[A-Za-z0-9\-\_]+$")
     if not allowed.fullmatch(serial) or not allowed.fullmatch(random_code):
         raise HTTPException(400, "Ungültige Eingabe")
 
-    # 4. الاستعلام من قاعدة البيانات
+    # 5) الاستعلام من قاعدة البيانات
     row = await database.fetch_one(
         """
         SELECT firstname, lastname, cert_name, birthdate
@@ -464,12 +474,28 @@ async def verify_public(request: Request, payload: dict):
     }
 
 
-@app.get("/wake_public")
-async def wake_public(request: Request):
+
+from typing import Optional
+
+@app.post("/wake_public")
+async def wake_public(
+    request: Request,
+    payload: dict,
+    x_signature: str = Header(None),
+    x_timestamp: str = Header(None),
+    authorization: str = Header(None),
+):
+    # السماح فقط من الموقع الحقيقي (زيادة أمان)
     origin = request.headers.get("origin")
     if origin not in ALLOWED_PUBLIC_ORIGINS:
         raise HTTPException(403, "Forbidden origin")
+
+    # توقيع HMAC + API KEY
+    verify_request_signature(payload, x_signature, x_timestamp, authorization)
+
     return {"status": "awake"}
+
+
 
 
 # ---- نظام كلمة السر مع محاولات وقفل ----
