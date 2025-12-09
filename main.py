@@ -5,14 +5,16 @@ import hashlib
 import json
 import re
 from datetime import datetime, timedelta
-
+import smtplib                  
+import ssl  
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import databases
 import sqlalchemy
 from dotenv import load_dotenv
-
+from email.message import EmailMessage
+from sqlalchemy import func
 # تحميل متغيرات البيئة من ملف .env
 load_dotenv()
 
@@ -24,7 +26,16 @@ DATABASE_URL = os.getenv(
 API_KEY = os.getenv("API_KEY", "your_api_key_hereasdasdasd")
 HMAC_SECRET = os.getenv("HMAC_SECRET", "your_hmac_secret_hereasdasdasdasd")
 
-DB_MAX_BYTES = int(os.getenv("DB_MAX_BYTES", "1000000000"))
+DB_MAX_BYTES = int(os.getenv("DB_MAX_BYTES", "500000000"))
+
+
+# ===== إعدادات البريد لكلمة السر المنسية =====
+RESET_EMAIL_TO = os.getenv("RESET_EMAIL_TO", "").strip()
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "1") == "1"
 
 ALLOWED_PUBLIC_ORIGINS = [
     "https://fimonova-kosmetik.de",
@@ -62,6 +73,18 @@ app_password_table = sqlalchemy.Table(
     sqlalchemy.Column("password_hash", sqlalchemy.Text, nullable=False),
     sqlalchemy.Column("failed_attempts", sqlalchemy.Integer, nullable=False, server_default="0"),
     sqlalchemy.Column("locked_until", sqlalchemy.DateTime),
+)
+# جدول طلبات إعادة تعيين كلمة السر
+password_reset_table = sqlalchemy.Table(
+    "app_password_reset",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("app_id", sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column("email", sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column("code_hash", sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column("expires_at", sqlalchemy.DateTime, nullable=False),
+    sqlalchemy.Column("used", sqlalchemy.Boolean, nullable=False, server_default="false"),
+    sqlalchemy.Column("created_at", sqlalchemy.DateTime, nullable=False, server_default=func.now()),
 )
 
 # ===== تطبيق FastAPI =====
@@ -101,6 +124,23 @@ class PasswordCheckPayload(BaseModel):
 
 class PasswordSetPayload(BaseModel):
     old_password: str
+    new_password: str
+    app_id: str | None = DEFAULT_APP_ID
+
+class PasswordForgotStartPayload(BaseModel):
+    """
+    بدء عملية نسيت كلمة السر:
+    لا نحتاج البريد من العميل، نستخدم RESET_EMAIL_TO من السيرفر.
+    """
+    app_id: str | None = DEFAULT_APP_ID
+
+
+class PasswordForgotFinishPayload(BaseModel):
+    """
+    إنهاء عملية نسيت كلمة السر:
+    المستخدم يرسل الكود الذي وصله على الإيميل + كلمة السر الجديدة.
+    """
+    code: str
     new_password: str
     app_id: str | None = DEFAULT_APP_ID
 
@@ -168,6 +208,79 @@ async def get_or_create_app_password(app_id: str = DEFAULT_APP_ID):
     )
     return row
 
+def generate_reset_code(length: int = 6) -> str:
+    """
+    توليد كود تحقق بسيط (أرقام فقط).
+    مثال: 083421
+    """
+    import random
+    return "".join(str(random.randint(0, 9)) for _ in range(length))
+
+
+def send_reset_email(to_email: str, code: str):
+    """
+    إرسال كود إعادة تعيين كلمة السر إلى بريد الأدمن.
+    """
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD and to_email):
+        raise RuntimeError("SMTP settings or RESET_EMAIL_TO not configured")
+
+    msg = EmailMessage()
+    msg["Subject"] = "Fimonova – كود إعادة تعيين كلمة السر"
+    msg["From"] = SMTP_USER
+    msg["To"] = to_email
+
+    body = (
+        "مرحباً 😊\n\n"
+        "تم طلب إعادة تعيين كلمة السر لتطبيق Fimonova Desktop Manager.\n\n"
+        f"كود التحقق هو: {code}\n\n"
+        "الكود صالح لمدة 15 دقيقة فقط.\n\n"
+        "إذا لم تقم أنت بطلب هذا الكود، تجاهل هذه الرسالة.\n"
+    )
+    msg.set_content(body)
+
+    if SMTP_USE_TLS:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls(context=context)
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+
+
+async def create_password_reset(app_id: str, email: str, code: str):
+    """
+    تخزين طلب إعادة كلمة السر (كود + مدة صلاحية 15 دقيقة).
+    نحفظ الكود بشكل مُشفّر (hash).
+    """
+    code_hash = hash_password(code)
+
+    # نحذف أي طلبات قديمة غير مستخدمة لهذا التطبيق
+    await database.execute(
+        """
+        DELETE FROM app_password_reset
+         WHERE app_id = :app_id
+            OR expires_at < :now
+        """,
+        {"app_id": app_id, "now": datetime.utcnow()},
+    )
+
+    expires_at = datetime.utcnow() + timedelta(minutes=15)
+
+    await database.execute(
+        """
+        INSERT INTO app_password_reset (app_id, email, code_hash, expires_at, used)
+        VALUES (:app_id, :email, :code_hash, :expires_at, false)
+        """,
+        {
+            "app_id": app_id,
+            "email": email,
+            "code_hash": code_hash,
+            "expires_at": expires_at,
+        },
+    )
 
 # ---- DB helpers ----
 
@@ -496,8 +609,6 @@ async def wake_public(
     return {"status": "awake"}
 
 
-
-
 # ---- نظام كلمة السر مع محاولات وقفل ----
 
 @app.post("/check_password")
@@ -623,6 +734,111 @@ async def set_password(
          WHERE app_id = :app_id
         """,
         {"password_hash": new_hash, "app_id": app_id},
+    )
+
+    return {"ok": True}
+
+
+@app.post("/forgot_password_start")
+async def forgot_password_start(
+    payload: PasswordForgotStartPayload,
+    request: Request,
+    x_signature: str = Header(None),
+    x_timestamp: str = Header(None),
+    authorization: str = Header(None),
+):
+    """
+    بدء عملية "نسيت كلمة السر":
+    - محمي بـ HMAC + API_KEY مثل باقي الانتبوينتات.
+    - يستخدم RESET_EMAIL_TO من إعدادات السيرفر.
+    - يولّد كود عشوائي، يخزنه بشكل مُشفّر، ويرسله إلى البريد.
+    """
+    if not RESET_EMAIL_TO:
+        raise HTTPException(500, "RESET_EMAIL_TO is not configured on server")
+
+    body = payload.dict()
+    verify_request_signature(body, x_signature, x_timestamp, authorization)
+
+    app_id = body.get("app_id") or DEFAULT_APP_ID
+
+    # نتأكد أن هناك صف كلمة سر موجود (ينشئه لو مش موجود)
+    await get_or_create_app_password(app_id)
+
+    code = generate_reset_code()
+    try:
+        await create_password_reset(app_id, RESET_EMAIL_TO, code)
+        send_reset_email(RESET_EMAIL_TO, code)
+    except Exception as e:
+        print("forgot_password_start error:", e)
+        raise HTTPException(500, "Failed to send reset email")
+
+    return {"ok": True}
+
+
+@app.post("/forgot_password_finish")
+async def forgot_password_finish(
+    payload: PasswordForgotFinishPayload,
+    request: Request,
+    x_signature: str = Header(None),
+    x_timestamp: str = Header(None),
+    authorization: str = Header(None),
+):
+    """
+    إنهاء عملية "نسيت كلمة السر":
+    - يتحقق من الكود + الصلاحية.
+    - يحدّث كلمة السر في جدول app_password.
+    - يصفر failed_attempts ويلغي القفل.
+    """
+    body = payload.dict()
+    verify_request_signature(body, x_signature, x_timestamp, authorization)
+
+    app_id = body.get("app_id") or DEFAULT_APP_ID
+    code = body["code"]
+    new_password = body["new_password"]
+
+    # نجيب آخر طلب reset غير مستخدم
+    row = await database.fetch_one(
+        """
+        SELECT * FROM app_password_reset
+         WHERE app_id = :app_id
+           AND used = false
+         ORDER BY created_at DESC
+         LIMIT 1
+        """,
+        {"app_id": app_id},
+    )
+
+    if not row:
+        return {"ok": False, "reason": "no_reset_request"}
+
+    if row["expires_at"] and row["expires_at"] < datetime.utcnow():
+        return {"ok": False, "reason": "code_expired"}
+
+    # تحقق من الكود
+    if hash_password(code) != row["code_hash"]:
+        return {"ok": False, "reason": "invalid_code"}
+
+    # نحدّث كلمة السر في app_password
+    new_hash = hash_password(new_password)
+    await database.execute(
+        """
+        UPDATE app_password
+           SET password_hash   = :password_hash,
+               failed_attempts = 0,
+               locked_until    = NULL
+         WHERE app_id = :app_id
+        """,
+        {"password_hash": new_hash, "app_id": app_id},
+    )
+
+    # نعلّم طلب reset أنه تم استخدامه
+    await database.execute(
+        """
+        UPDATE app_password_reset
+           SET used = true
+         WHERE id = :id
+        """,
+        {"id": row["id"]},
     )
 
     return {"ok": True}

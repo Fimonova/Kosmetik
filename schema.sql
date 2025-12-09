@@ -1,5 +1,4 @@
--- schema.sql الجديد (متوافق مع main.py)
-
+-- جدول الطلاب
 CREATE TABLE IF NOT EXISTS students (
   id SERIAL PRIMARY KEY,
   firstname TEXT NOT NULL,
@@ -11,13 +10,7 @@ CREATE TABLE IF NOT EXISTS students (
   cert_random_code TEXT
 );
 
--- جدول بسيط لتخزين كلمة سر تطبيق التجنر (بشكل مُشفّر)
-CREATE TABLE IF NOT EXISTS app_password (
-  id SERIAL PRIMARY KEY,
-  password_hash TEXT NOT NULL,
-  updated_at   TEXT
-);
-
+-- جدول كلمة السر للتطبيق مع العدّاد والقفل
 CREATE TABLE IF NOT EXISTS app_password (
   id SERIAL PRIMARY KEY,
   app_id TEXT UNIQUE NOT NULL,
@@ -26,6 +19,16 @@ CREATE TABLE IF NOT EXISTS app_password (
   locked_until TIMESTAMPTZ
 );
 
+-- جدول طلبات إعادة تعيين كلمة السر
+CREATE TABLE IF NOT EXISTS app_password_reset (
+  id SERIAL PRIMARY KEY,
+  app_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 CREATE INDEX IF NOT EXISTS idx_students_name_birth
 ON students (firstname, lastname, birthdate);
