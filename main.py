@@ -529,9 +529,9 @@ async def check_password(
     app_id = body.get("app_id") or DEFAULT_APP_ID
     row = await get_or_create_app_password(app_id)
 
-    now = datetime.utcnow()
     locked_until = row["locked_until"]
-    failed_attempts = row["failed_attemptments"] if "failed_attemptments" in row.keys() else row["failed_attempts"] or 0
+    now = datetime.utcnow()
+    failed_attempts = int(row["failed_attempts"] or 0)
 
     # لو مقفول حالياً
     if locked_until and locked_until > now:
